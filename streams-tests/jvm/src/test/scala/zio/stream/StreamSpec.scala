@@ -7,8 +7,8 @@ import StreamUtils._
 import zio.Exit.Success
 import zio.ZQueueSpecUtil.waitForSize
 import zio._
-import zio.clock.Clock
 import zio.duration._
+import zio.stm.TQueue
 import zio.test.Assertion.{
   dies,
   equalTo,
@@ -25,6 +25,7 @@ import zio.test.Assertion.{
 }
 import zio.test.TestAspect.flaky
 import zio.test._
+import zio.test.environment.{ Live, TestClock }
 
 object StreamSpec extends ZIOBaseSpec {
 
@@ -715,10 +716,26 @@ object StreamSpec extends ZIOBaseSpec {
           _      <- stream.runDrain
           result <- effects.get
         } yield assert(result)(equalTo(List(1, 2, 3, 4, 4, 4, 3, 2, 3, 4, 4, 4, 3, 2, 1).reverse))
+      },
+      testM("exit signal") {
+        for {
+          ref <- Ref.make(false)
+          inner = Stream
+            .bracketExit(UIO.unit)(
+              (_, e) =>
+                e match {
+                  case Exit.Failure(_) => ref.set(true)
+                  case Exit.Success(_) => UIO.unit
+                }
+            )
+            .flatMap(_ => Stream.fail("Ouch"))
+          _   <- Stream.succeed(()).flatMap(_ => inner).runDrain.either.unit
+          fin <- ref.get
+        } yield assert(fin)(isTrue)
       }
     ),
     suite("Stream.flatMapPar / flattenPar / mergeAll")(
-      testM("guarantee ordering")(checkM(Gen.small(Gen.listOfN(_)(Gen.anyInt))) { m: List[Int] =>
+      testM("guarantee ordering")(checkM(Gen.small(Gen.listOfN(_)(Gen.anyInt))) { (m: List[Int]) =>
         for {
           flatMap    <- Stream.fromIterable(m).flatMap(i => Stream(i, i)).runCollect
           flatMapPar <- Stream.fromIterable(m).flatMapPar(1)(i => Stream(i, i)).runCollect
@@ -1044,6 +1061,20 @@ object StreamSpec extends ZIOBaseSpec {
         items <- fiber.join
       } yield assert(items)(equalTo(c.toSeq.toList))
     }),
+    testM("Stream.fromTQueue") {
+      TQueue.bounded[Int](5).commit.flatMap {
+        tqueue =>
+          ZStream.fromTQueue(tqueue).toQueueUnbounded.use { (queue: Queue[Take[Nothing, Int]]) =>
+            for {
+              _      <- tqueue.offerAll(List(1, 2, 3)).commit
+              first  <- ZIO.collectAll(ZIO.replicate(3)(queue.take))
+              _      <- tqueue.offerAll(List(4, 5)).commit
+              second <- ZIO.collectAll(ZIO.replicate(2)(queue.take))
+            } yield assert(first)(equalTo(List(1, 2, 3).map(Take.Value(_)))) &&
+              assert(second)(equalTo(List(4, 5).map(Take.Value(_))))
+          }
+      }
+    },
     suite("Stream.fromEffectOption")(
       testM("emit one element with success") {
         val fa: ZIO[Any, Option[Int], Int] = ZIO.succeed(5)
@@ -1117,7 +1148,38 @@ object StreamSpec extends ZIOBaseSpec {
       }
     ),
     testM("Stream.grouped")(
-      assertM(Stream(1, 2, 3, 4).grouped(2).run(ZSink.collectAll[List[Int]]))(equalTo(List(List(1, 2), List(3, 4))))
+      assertM(Stream(1, 2, 3, 4).grouped(2).runCollect)(equalTo(List(List(1, 2), List(3, 4))))
+    ),
+    suite("Stream.groupedWithin")(
+      testM("group before chunk size is reached due to time window") {
+        Queue.bounded[Take[Nothing, Int]](8).flatMap {
+          queue =>
+            Ref
+              .make[List[List[Take[Nothing, Int]]]](
+                List(
+                  List(Take.Value(1), Take.Value(2)),
+                  List(Take.Value(3), Take.Value(4)),
+                  List(Take.Value(5), Take.End)
+                )
+              )
+              .flatMap { ref =>
+                val offer = ref.modify {
+                  case x :: xs => (x, xs)
+                  case Nil     => (Nil, Nil)
+                }.flatMap(queue.offerAll)
+                val stream = ZStream.fromEffect(offer) *> ZStream
+                  .fromQueue(queue)
+                  .unTake
+                  .tap(_ => TestClock.adjust(1.second))
+                  .groupedWithin(10, 2.seconds)
+                  .tap(_ => offer)
+                assertM(stream.runCollect)(equalTo(List(List(1, 2), List(3, 4), List(5))))
+              }
+        }
+      } @@ flaky,
+      testM("group immediately when chunk size is reached") {
+        assertM(ZStream(1, 2, 3, 4).groupedWithin(2, 10.seconds).runCollect)(equalTo(List(List(1, 2), List(3, 4))))
+      }
     ),
     suite("Stream.runHead")(
       testM("nonempty stream")(
@@ -1310,14 +1372,14 @@ object StreamSpec extends ZIOBaseSpec {
       )
     ),
     testM("Stream.repeatEffectWith")(
-      (for {
+      Live.live(for {
         ref <- Ref.make[List[Int]](Nil)
         _ <- ZStream
               .repeatEffectWith(ref.update(1 :: _), Schedule.spaced(10.millis))
               .take(2)
               .run(Sink.drain)
         result <- ref.get
-      } yield assert(result)(equalTo(List(1, 1)))).provide(Clock.Live)
+      } yield assert(result)(equalTo(List(1, 1))))
     ),
     suite("Stream.mapMPar")(
       testM("foreachParN equivalence") {
@@ -1521,7 +1583,7 @@ object StreamSpec extends ZIOBaseSpec {
         )(equalTo(List(1, 1, 1, 1, 1)))
       ),
       testM("short circuits")(
-        (for {
+        Live.live(for {
           ref <- Ref.make[List[Int]](Nil)
           _ <- Stream
                 .fromEffect(ref.update(1 :: _))
@@ -1529,7 +1591,7 @@ object StreamSpec extends ZIOBaseSpec {
                 .take(2)
                 .run(Sink.drain)
           result <- ref.get
-        } yield assert(result)(equalTo(List(1, 1)))).provide(Clock.Live)
+        } yield assert(result)(equalTo(List(1, 1))))
       )
     ),
     suite("Stream.repeatEither")(
@@ -1555,7 +1617,7 @@ object StreamSpec extends ZIOBaseSpec {
         )
       ),
       testM("short circuits") {
-        (for {
+        Live.live(for {
           ref <- Ref.make[List[Int]](Nil)
           _ <- Stream
                 .fromEffect(ref.update(1 :: _))
@@ -1563,7 +1625,7 @@ object StreamSpec extends ZIOBaseSpec {
                 .take(3) // take one schedule output
                 .run(Sink.drain)
           result <- ref.get
-        } yield assert(result)(equalTo(List(1, 1)))).provide(Clock.Live)
+        } yield assert(result)(equalTo(List(1, 1))))
       }
     ),
     suite("Stream.schedule")(
@@ -1719,15 +1781,15 @@ object StreamSpec extends ZIOBaseSpec {
           .runCollect
       )(equalTo(List(1, 2, 3, 4)))
     }),
-    testM("Stream.toQueue")(checkM(smallChunks(Gen.anyInt)) { c: Chunk[Int] =>
+    testM("Stream.toQueue")(checkM(smallChunks(Gen.anyInt)) { (c: Chunk[Int]) =>
       val s = Stream.fromChunk(c)
-      assertM(s.toQueue(1000).use { queue: Queue[Take[Nothing, Int]] =>
+      assertM(s.toQueue(1000).use { (queue: Queue[Take[Nothing, Int]]) =>
         waitForSize(queue, c.length + 1) *> queue.takeAll
       })(equalTo(c.toSeq.toList.map(i => Take.Value(i)) :+ Take.End))
     }),
-    testM("Stream.toQueueUnbounded")(checkM(smallChunks(Gen.anyInt)) { c: Chunk[Int] =>
+    testM("Stream.toQueueUnbounded")(checkM(smallChunks(Gen.anyInt)) { (c: Chunk[Int]) =>
       val s = Stream.fromChunk(c)
-      assertM(s.toQueueUnbounded.use { queue: Queue[Take[Nothing, Int]] =>
+      assertM(s.toQueueUnbounded.use { (queue: Queue[Take[Nothing, Int]]) =>
         waitForSize(queue, c.length + 1) *> queue.takeAll
       })(equalTo(c.toSeq.toList.map(i => Take.Value(i)) :+ Take.End))
     }),

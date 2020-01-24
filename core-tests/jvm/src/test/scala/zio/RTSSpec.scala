@@ -8,6 +8,7 @@ import zio.duration._
 import zio.test.Assertion._
 import zio.test.TestAspect.{ flaky, jvm, nonFlaky }
 import zio.test._
+import zio.test.environment.Live
 
 object RTSSpec extends ZIOBaseSpec {
 
@@ -27,16 +28,13 @@ object RTSSpec extends ZIOBaseSpec {
           accum <- Ref.make(Set.empty[Thread])
           b     <- runAndTrack(accum).repeat(Schedule.doUntil[Boolean](_ == true))
         } yield b
-
-      val env = new Clock.Live with Blocking.Live
-
-      assertM(io.provide(env))(isTrue)
+      assertM(Live.live(io))(isTrue)
     },
     testM("blocking IO is effect blocking") {
       for {
         done  <- Ref.make(false)
         start <- IO.succeed(internal.OneShot.make[Unit])
-        fiber <- blocking.effectBlocking { start.set(()); Thread.sleep(60L * 60L * 1000L) }
+        fiber <- blocking.effectBlockingInterrupt { start.set(()); Thread.sleep(60L * 60L * 1000L) }
                   .ensuring(done.set(true))
                   .fork
         _     <- IO.succeed(start.get())
@@ -144,7 +142,7 @@ object RTSSpec extends ZIOBaseSpec {
                 .repeat(Schedule.doUntil[Int](_ >= 1)) <* f.interrupt
         } yield c
 
-      assertM(zio.provide(Clock.Live))(isGreaterThanEqualTo(1))
+      assertM(Live.live(zio))(isGreaterThanEqualTo(1))
     }
   )
 }

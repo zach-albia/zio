@@ -16,6 +16,8 @@
 
 package zio
 
+import java.util.concurrent.atomic.AtomicReferenceArray
+
 import scala.concurrent.ExecutionContext
 import scala.reflect.ClassTag
 import scala.util.{ Failure, Success }
@@ -388,6 +390,8 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
    * specified `finalizer` is guaranteed to begin execution, whether this effect
    * succeeds, fails, or is interrupted.
    *
+   * For use cases that need access to the effect's result, see [[ZIO#onExit]].
+   *
    * Finalizers offer very powerful guarantees, but they are low-level, and
    * should generally not be used for releasing resources. For higher-level
    * logic built on `ensuring`, see `ZIO#bracket`.
@@ -588,16 +592,29 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
   final def fork: URIO[R, Fiber[E, A]] = new ZIO.Fork(self)
 
   /**
-   * Like [[fork]] but handles an error with the provided handler.
-   */
-  final def forkWithErrorHandler(handler: E => UIO[Unit]): URIO[R, Fiber[E, A]] =
-    onError(new ZIO.FoldCauseMFailureFn(handler)).run.fork.map(_.mapM(IO.done))
-
-  /**
    * Forks the effect into a new independent fiber, with the specified name.
    */
   final def forkAs(name: String): URIO[R, Fiber[E, A]] =
     (Fiber.fiberName.set(Some(name)) *> self).fork
+
+  /**
+   * Forks the effect into a new daemon fiber, but immediately restores the
+   * fiber's daemon status to the inherited status from whatever region the
+   * effect is composed into. This means that the forked fiber will not be
+   * interrupted if its parent fiber is interrupted, but fibers forked by the
+   * forked fiber will be interrupted if the forked fiber is interrupted,
+   * assuming the effect is in a non-daemon region (the default).
+   */
+  final def forkDaemon: URIO[R, Fiber[E, A]] =
+    ZIO.daemonMask(restore => restore(self).fork)
+
+  /**
+   * Forks the fiber in a [[ZManaged]]. Using the [[ZManaged]] value will
+   * execute the effect in the fiber, while ensuring its interruption when
+   * the effect supplied to [[ZManaged#use]] completes.
+   */
+  final def forkManaged: ZManaged[R, Nothing, Fiber[E, A]] =
+    toManaged_.fork
 
   /**
    * Forks an effect that will be executed on the specified `ExecutionContext`.
@@ -605,6 +622,15 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
   final def forkOn(ec: ExecutionContext): ZIO[R, E, Fiber[E, A]] =
     self.on(ec).fork
 
+  /**
+   * Like [[fork]] but handles an error with the provided handler.
+   */
+  final def forkWithErrorHandler(handler: E => UIO[Unit]): URIO[R, Fiber[E, A]] =
+    onError(new ZIO.FoldCauseMFailureFn(handler)).run.fork.map(_.mapM(IO.done))
+
+  /**
+   * Unwraps the optional error, defaulting to the provided value.
+   */
   final def flattenErrorOption[E1, E2 <: E1](default: E2)(implicit ev: E <:< Option[E1]): ZIO[R, E1, A] =
     self.mapError(e => ev(e).getOrElse(default))
 
@@ -766,6 +792,13 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
     )(_ => self)
 
   /**
+   * Ensures that a cleanup functions runs, whether this effect succeeds,
+   * fails, or is interrupted.
+   */
+  final def onExit[R1 <: R](cleanup: Exit[E, A] => URIO[R1, Any]): ZIO[R1, E, A] =
+    ZIO.bracketExit(ZIO.unit)((_, exit: Exit[E, A]) => cleanup(exit))(_ => self)
+
+  /**
    * Propagates the success value to the first element of a tuple, but
    * passes the effect input `R` along unmodified as the second element
    * of the tuple.
@@ -870,6 +903,12 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
    * its dependency on `R`.
    */
   final def provide(r: R)(implicit ev: NeedsEnv[R]): IO[E, A] = ZIO.provide(r)(self)
+
+  /**
+   * Provides a layer to the ZIO effect, which translates it to another level.
+   */
+  final def provideLayer[E1 >: E, R0, R1 <: Has[_]](layer: ZLayer[R0, E1, R1])(implicit ev: R1 <:< R): ZIO[R0, E1, A] =
+    provideSomeManaged(layer.value.map(ev))
 
   /**
    * An effectual version of `provide`, useful when the act of provision
@@ -1385,6 +1424,16 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
     self.foldCauseM(new ZIO.TapErrorRefailFn(f), new ZIO.TapFn(g))
 
   /**
+   * Returns an effect that effectually "peeks" at the cause of the failure of
+   * this effect.
+   * {{{
+   * readFile("data.json").tapCause(logCause(_))
+   * }}}
+   */
+  final def tapCause[R1 <: R, E1 >: E](f: Cause[E] => ZIO[R1, E1, Any]): ZIO[R1, E1, A] =
+    self.foldCauseM(new ZIO.TapCauseRefailFn(f), ZIO.succeed)
+
+  /**
    * Returns an effect that effectfully "peeks" at the failure of this effect.
    * {{{
    * readFile("data.json").tapError(logError(_))
@@ -1550,7 +1599,7 @@ sealed trait ZIO[-R, +E, +A] extends Serializable { self =>
   /**
    * The moral equivalent of `if (p) exp`
    */
-  final def when[R1 <: R, E1 >: E](b: Boolean): ZIO[R1, E1, Unit] =
+  final def when[R1 <: R, E1 >: E](b: => Boolean): ZIO[R1, E1, Unit] =
     ZIO.when(b)(self)
 
   /**
@@ -2231,29 +2280,62 @@ object ZIO {
    *
    * For a sequential version of this method, see `foreach`.
    */
-  def foreachPar[R, E, A, B](as: Iterable[A])(fn: A => ZIO[R, E, B]): ZIO[R, E, List[B]] =
-    as.foldRight[ZIO[R, E, List[B]]](effectTotal(Nil)) { (a, io) =>
-        fn(a).zipWithPar(io)((b, bs) => b :: bs)
+  def foreachPar[R, E, A, B](as: Iterable[A])(fn: A => ZIO[R, E, B]): ZIO[R, E, List[B]] = {
+    val size      = as.size
+    val resultArr = new AtomicReferenceArray[B](size)
+
+    val wrappedFn: ZIOFn1[(A, Int), ZIO[R, E, Any]] = ZIOFn(fn) {
+      case (a, i) => fn(a).tap(b => ZIO.effectTotal(resultArr.set(i, b)))
+    }
+
+    foreachPar_(as.zipWithIndex)(wrappedFn).as(
+      (0 until size).reverse.foldLeft[List[B]](Nil) { (acc, i) =>
+        resultArr.get(i) :: acc
       }
-      .refailWithTrace
+    )
+  }
 
   /**
    * Applies the function `f` to each element of the `Iterable[A]` and runs
    * produced effects in parallel, discarding the results.
    *
    * For a sequential version of this method, see `foreach_`.
+   *
+   * Optimized to avoid keeping full tree of effects, so that method could be
+   * able to handle large input sequences.
+   * Behaves almost like this code:
+   *
+   * {{{
+   * as.foldLeft(ZIO.unit) { (acc, a) => acc.zipParLeft(f(a)) }
+   * }}}
+   *
+   * Additionally, interrupts all effects on any failure.
    */
   def foreachPar_[R, E, A](as: Iterable[A])(f: A => ZIO[R, E, Any]): ZIO[R, E, Unit] =
-    ZIO
-      .effectTotal(as.iterator)
-      .flatMap { i =>
-        def loop(a: A): ZIO[R, E, Unit] =
-          if (i.hasNext) f(a).zipWithPar(loop(i.next))((_, _) => ())
-          else f(a).unit
-        if (i.hasNext) loop(i.next)
-        else ZIO.unit
-      }
-      .refailWithTrace
+    if (as.isEmpty) ZIO.unit
+    else {
+      val size = as.size
+      for {
+        parentId <- ZIO.fiberId
+        causes   <- Ref.make[Cause[E]](Cause.empty)
+        result   <- Promise.make[Unit, Unit]
+        succeed  <- Ref.make(0)
+        fibers <- ZIO.traverse(as) {
+                   f(_)
+                     .foldCauseM(c => causes.update(_ && c) *> result.fail(()), _ => {
+                       (succeed.update(_ + 1) >>= { succeed =>
+                         ZIO.when(succeed == size)(result.succeed(()))
+                       }).uninterruptible
+                     })
+                     .fork
+                 }
+        interrupter = result.await
+          .catchAll(_ => ZIO.foreach(fibers)(_.interruptAs(parentId).fork) >>= Fiber.joinAll)
+          .toManaged_
+          .fork
+        _ <- interrupter.use_(result.await.foldM(_ => causes.get >>= ZIO.halt, _ => ZIO.unit).refailWithTrace)
+      } yield ()
+    }
 
   /**
    * Applies the function `f` to each element of the `Iterable[A]` in parallel,
@@ -2582,11 +2664,20 @@ object ZIO {
 
   /**
    * Merges an `Iterable[IO]` to a single IO, working in parallel.
+   *
+   * It's unsafe to execute side effects inside `f`, as `f` may be executed
+   * more than once for some of `in` elements during effect execution.
    */
   def mergeAllPar[R, E, A, B](
     in: Iterable[ZIO[R, E, A]]
   )(zero: B)(f: (B, A) => B): ZIO[R, E, B] =
-    in.foldLeft[ZIO[R, E, B]](succeed[B](zero))((acc, a) => acc.zipPar(a).map(f.tupled)).refailWithTrace
+    Ref.make(zero) >>= { acc =>
+      foreachPar_(in) {
+        Predef.identity(_) >>= { a =>
+          acc.update(f(_, a))
+        }
+      } *> acc.get
+    }
 
   /**
    * Makes the effect non-daemon, but passes it a restore function that
@@ -2680,10 +2771,17 @@ object ZIO {
    */
   def reduceAllPar[R, R1 <: R, E, A](a: ZIO[R, E, A], as: Iterable[ZIO[R1, E, A]])(
     f: (A, A) => A
-  ): ZIO[R1, E, A] =
-    as.foldLeft[ZIO[R1, E, A]](a) { (l, r) =>
-      l.zipPar(r).map(f.tupled)
-    }
+  ): ZIO[R1, E, A] = {
+    def prepend[Z](z: Z, zs: Iterable[Z]): Iterable[Z] =
+      new Iterable[Z] {
+        override def iterator: Iterator[Z] = Iterator(z) ++ zs.iterator
+      }
+
+    val all = prepend(a, as)
+    mergeAllPar(all)(Option.empty[A]) { (acc, elem) =>
+      Some(acc.fold(elem)(f(_, elem)))
+    }.map(_.get)
+  }
 
   /**
    * Replicates the given effect n times.
@@ -2908,7 +3006,7 @@ object ZIO {
   /**
    * The moral equivalent of `if (p) exp`
    */
-  def when[R, E](b: Boolean)(zio: ZIO[R, E, Any]): ZIO[R, E, Unit] =
+  def when[R, E](b: => Boolean)(zio: ZIO[R, E, Any]): ZIO[R, E, Unit] =
     if (b) zio.unit else unit
 
   /**
@@ -2986,6 +3084,16 @@ object ZIO {
      */
     def refineToOrDie[E1 <: E: ClassTag](implicit ev: CanFail[E]): ZIO[R, E1, A] =
       self.refineOrDie { case e: E1 => e }
+  }
+
+  /**
+   * TODO: Document and pull out to top-level.
+   */
+  def provideOne[R1](r1: R1): ProvideOne[R1] = new ProvideOne[R1](r1)
+
+  class ProvideOne[R1](r1: R1) {
+    def apply[R2 <: Has[_], E, A](zio: ZIO[Has[R1] with R2, E, A])(implicit R1: Tagged[R1]): ZIO[R2, E, A] =
+      zio.provideSome[R2](r2 => r2.add(r1))
   }
 
   implicit final class ZIOWithFilterOps[R, E, A](private val self: ZIO[R, E, A]) extends AnyVal {
@@ -3176,10 +3284,25 @@ object ZIO {
       c.failureOrCause.fold(underlying, ZIO.halt)
   }
 
+  final class TapCauseRefailFn[R, E, E1 >: E, A](override val underlying: Cause[E] => ZIO[R, E1, Any])
+      extends ZIOFn1[Cause[E], ZIO[R, E1, Nothing]] {
+    def apply(c1: Cause[E]): ZIO[R, E1, Nothing] =
+      underlying(c1).foldCauseM(
+        c2 => ZIO.halt(Cause.Then(c1, c2)),
+        _ => ZIO.halt(c1)
+      )
+  }
+
   final class TapErrorRefailFn[R, E, E1 >: E, A](override val underlying: E => ZIO[R, E1, Any])
       extends ZIOFn1[Cause[E], ZIO[R, E1, Nothing]] {
-    def apply(c: Cause[E]): ZIO[R, E1, Nothing] =
-      c.failureOrCause.fold(underlying(_) *> ZIO.halt(c), _ => ZIO.halt(c))
+    def apply(c1: Cause[E]): ZIO[R, E1, Nothing] =
+      c1.failureOrCause.fold(
+        underlying(_).foldCauseM(
+          c2 => ZIO.halt(Cause.Then(c1, c2)),
+          _ => ZIO.halt(c1)
+        ),
+        _ => ZIO.halt(c1)
+      )
   }
 
   private[zio] object Tags {

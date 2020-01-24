@@ -27,9 +27,50 @@ object StreamPullSafetySpec extends ZIOBaseSpec {
           .use(nPulls(_, 5))
           .map(assert(_)(equalTo(List(Right(3), Left(Some("Ouch")), Right(7), Left(None), Left(None)))))
       },
+      testM("is safe to pull again after initial failure") {
+        def initFailureSink(ref: Ref[(Int, Boolean)]): Sink[String, Nothing, Int, String] =
+          new Sink[String, Nothing, Int, String] {
+            type State = Option[Int]
+
+            def initial: IO[String, State] =
+              ref.modify {
+                case (n, failed) =>
+                  if (failed) (UIO.succeed(None), (n + 1, false)) else (IO.fail("Ouch"), (n, true))
+              }.flatten
+
+            def step(s: State, a: Int): UIO[State] = UIO.succeed(Some(a))
+
+            def extract(s: State): IO[String, (String, Chunk[Nothing])] =
+              IO.fromOption(s).map(n => (n.toString, Chunk.empty)).asError("Empty")
+
+            def cont(s: State): Boolean = s.isEmpty
+          }
+
+        for {
+          ref <- Ref.make((1, false))
+          pulls <- Stream(1, 2, 3)
+                    .aggregate(initFailureSink(ref))
+                    .process
+                    .use(nPulls(_, 9))
+        } yield assert(pulls)(
+          equalTo(
+            List(
+              Left(Some("Ouch")),
+              Right("1"),
+              Left(Some("Ouch")),
+              Right("2"),
+              Left(Some("Ouch")),
+              Right("3"),
+              Left(Some("Ouch")),
+              Left(None),
+              Left(None)
+            )
+          )
+        )
+      },
       testM("is safe to pull again after sink step failure") {
         Stream(1, 2, 3, 4)
-          .aggregate(ZSink.identity[Int].contramapM { n: Int =>
+          .aggregate(ZSink.identity[Int].contramapM { (n: Int) =>
             if (n % 2 == 0) IO.fail("Ouch") else UIO.succeed(n)
           })
           .process
@@ -41,7 +82,7 @@ object StreamPullSafetySpec extends ZIOBaseSpec {
       testM("is safe to pull again after sink extraction failure") {
         assertM(
           Stream(1, 2, 3, 4)
-            .aggregate(ZSink.fromFunctionM { n: Int =>
+            .aggregate(ZSink.fromFunctionM { (n: Int) =>
               if (n % 2 == 0) IO.fail("Ouch") else UIO.succeed(n)
             })
             .process
@@ -69,6 +110,48 @@ object StreamPullSafetySpec extends ZIOBaseSpec {
           .map(assert(_)(equalTo(List(Left(Some("Ouch")), Left(None), Left(None)))))
       }
     ),
+    testM("Stream.buffer is safe to pull again") {
+      assertM(
+        Stream(1, 2, 3, 4, 5)
+          .mapM(n => if (n % 2 == 0) IO.fail(s"Ouch $n") else UIO.succeed(n))
+          .buffer(2)
+          .process
+          .use(nPulls(_, 7))
+      )(
+        equalTo(
+          List(
+            Right(1),
+            Left(Some("Ouch 2")),
+            Right(3),
+            Left(Some("Ouch 4")),
+            Right(5),
+            Left(None),
+            Left(None)
+          )
+        )
+      )
+    },
+    testM("Stream.bufferUnbounded is safe to pull again") {
+      assertM(
+        Stream(1, 2, 3, 4, 5)
+          .mapM(n => if (n % 2 == 0) IO.fail(s"Ouch $n") else UIO.succeed(n))
+          .bufferUnbounded
+          .process
+          .use(nPulls(_, 7))
+      )(
+        equalTo(
+          List(
+            Right(1),
+            Left(Some("Ouch 2")),
+            Right(3),
+            Left(Some("Ouch 4")),
+            Right(5),
+            Left(None),
+            Left(None)
+          )
+        )
+      )
+    },
     testM("Stream.drop is safe to pull again") {
       assertM(
         Stream(1, 2, 3, 4, 5, 6, 7)
@@ -121,6 +204,35 @@ object StreamPullSafetySpec extends ZIOBaseSpec {
         )(equalTo(List(Left(Some("Ouch 2")), Right(3), Left(Some("Ouch 4")), Right(5), Left(None), Left(None))))
       }
     ),
+    testM("Stream.flatMap is safe to pull again") {
+      for {
+        ref <- Ref.make(List.empty[String])
+        pulls <- Stream(1, 2, 3, 4).flatMap { n =>
+                  if (n % 2 == 0) {
+                    (Stream.fail(s"Ouch $n") ++ Stream.succeed(n))
+                      .tap(_ => ref.update(s"inner $n" :: _))
+                      .ensuring(ref.update(s"outer $n" :: _))
+                  } else {
+                    Stream.succeed(n)
+                  }
+                }.process
+                  .use(nPulls(_, 8))
+        finalizers <- ref.get
+      } yield assert(pulls)(
+        equalTo(
+          List(
+            Right(1),
+            Left(Some("Ouch 2")),
+            Right(2),
+            Right(3),
+            Left(Some("Ouch 4")),
+            Right(4),
+            Left(None),
+            Left(None)
+          )
+        )
+      ) && assert(finalizers)(equalTo(List("outer 4", "inner 4", "outer 2", "inner 2")))
+    },
     testM("Stream.mapAccumM is safe to pull again") {
       assertM(
         Stream(1, 2, 3, 4, 5)

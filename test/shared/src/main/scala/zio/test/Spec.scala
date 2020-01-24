@@ -60,6 +60,16 @@ final case class Spec[-R, +E, +L, +T](caseValue: SpecCase[R, E, L, T, Spec[R, E,
     }
 
   /**
+   * Returns the number of tests in the spec that satisfy the specified
+   * predicate.
+   */
+  final def countTests(f: T => Boolean): ZIO[R, E, Int] =
+    fold[ZIO[R, E, Int]] {
+      case SuiteCase(_, specs, _) => specs.flatMap(ZIO.collectAll(_).map(_.sum))
+      case TestCase(_, test)      => test.map(t => if (f(t)) 1 else 0)
+    }
+
+  /**
    * Returns a new spec with the suite labels distinguished by `Left`, and the
    * test labels distinguished by `Right`.
    */
@@ -244,6 +254,28 @@ final case class Spec[-R, +E, +L, +T](caseValue: SpecCase[R, E, L, T, Spec[R, E,
     provideM(ZIO.succeed(r))
 
   /**
+   * Provides a layer to the spec, translating it up a level.
+   */
+  final def provideLayer[E1 >: E, R0, R1 <: Has[_]](
+    layer: ZLayer[R0, E1, R1]
+  )(implicit ev: R1 <:< R): Spec[R0, E1, L, T] =
+    self.provideSomeManaged(for {
+      r0 <- ZManaged.environment[R0]
+      r1 <- layer.value.provide(r0)
+    } yield ev(r1))
+
+  /**
+   * Provides a layer to the spec, sharing services between all tests.
+   */
+  final def provideLayerShared[E1 >: E, R0, R1 <: Has[_]](
+    layer: ZLayer[R0, E1, R1]
+  )(implicit ev: R1 <:< R): Spec[R0, E1, L, T] =
+    self.provideSomeManagedShared(for {
+      r0 <- ZManaged.environment[R0]
+      r1 <- layer.value.provide(r0)
+    } yield ev(r1))
+
+  /**
    * Uses the specified effect to provide each test in this spec with its
    * required environment.
    */
@@ -311,12 +343,14 @@ final case class Spec[-R, +E, +L, +T](caseValue: SpecCase[R, E, L, T, Spec[R, E,
   final def provideSomeManagedShared[R0, E1 >: E](
     managed: ZManaged[R0, E1, R]
   )(implicit ev: NeedsEnv[R]): Spec[R0, E1, L, T] = {
-    def loop(r: R)(spec: Spec[R, E, L, T]): ZIO[R, E, Spec[Any, E, L, T]] =
+    def loop(r: R)(spec: Spec[R, E, L, T]): UIO[Spec[Any, E, L, T]] =
       spec.caseValue match {
         case SuiteCase(label, specs, exec) =>
-          specs.flatMap(ZIO.foreach(_)(loop(r))).map(z => Spec.suite(label, ZIO.succeed(z.toVector), exec))
+          specs.provide(r).run.map { result =>
+            Spec.suite(label, ZIO.done(result).flatMap(ZIO.foreach(_)(loop(r))).map(_.toVector), exec)
+          }
         case TestCase(label, test) =>
-          test.map(t => Spec.test(label, ZIO.succeed(t)))
+          test.provide(r).run.map(result => Spec.test(label, ZIO.done(result)))
       }
     caseValue match {
       case SuiteCase(label, specs, exec) =>

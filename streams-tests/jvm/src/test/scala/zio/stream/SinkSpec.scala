@@ -512,8 +512,7 @@ object SinkSpec extends ZIOBaseSpec {
             def extract(state: State)      = IO.fail("Ouch")
             def cont(state: State)         = true
           }
-          val sink = s.optional
-          assertM(sinkIteration(sink, 1))(equalTo((None, Chunk.single(1))))
+          assertM(sinkIteration(s.optional, 1))(equalTo((None, Chunk.single(1))))
         },
         testM("extract error") {
           val sink = extractErrorSink.optional
@@ -1246,6 +1245,7 @@ object SinkSpec extends ZIOBaseSpec {
               res1  <- sink.extract(step1).map(_._1)
               init2 <- sink.initial
               _     <- TestClock.adjust(23.milliseconds)
+              _     <- clock.sleep(23.milliseconds)
               step2 <- sink.step(init2, 2)
               res2  <- sink.extract(step2).map(_._1)
               init3 <- sink.initial
@@ -1255,6 +1255,7 @@ object SinkSpec extends ZIOBaseSpec {
               step4 <- sink.step(init4, 4)
               res4  <- sink.extract(step4).map(_._1)
               _     <- TestClock.adjust(11.milliseconds)
+              _     <- clock.sleep(11.milliseconds)
               init5 <- sink.initial
               step5 <- sink.step(init5, 5)
               res5  <- sink.extract(step5).map(_._1)
@@ -1271,6 +1272,7 @@ object SinkSpec extends ZIOBaseSpec {
               res1  <- sink.extract(step1).map(_._1)
               init2 <- sink.initial
               _     <- TestClock.adjust(23.milliseconds)
+              _     <- clock.sleep(23.milliseconds)
               step2 <- sink.step(init2, 2)
               res2  <- sink.extract(step2).map(_._1)
               init3 <- sink.initial
@@ -1280,6 +1282,7 @@ object SinkSpec extends ZIOBaseSpec {
               step4 <- sink.step(init4, 4)
               res4  <- sink.extract(step4).map(_._1)
               _     <- TestClock.adjust(11.milliseconds)
+              _     <- clock.sleep(11.milliseconds)
               init5 <- sink.initial
               step5 <- sink.step(init5, 5)
               res5  <- sink.extract(step5).map(_._1)

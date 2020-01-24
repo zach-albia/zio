@@ -827,6 +827,16 @@ object ZManagedSpec extends ZIOBaseSpec {
         ).use(ZIO.succeed)
       }
     ),
+    suite("tapCause")(
+      testM("does not lose infomrmation") {
+        val causes = Gen.causes(Gen.anyString, Gen.throwable)
+        checkM(causes, causes) { (c1, c2) =>
+          for {
+            exit <- ZManaged.halt(c1).tapCause(_ => ZManaged.halt(c2)).use(ZIO.succeed).run
+          } yield assert(exit)(failsCause(equalTo(Cause.Then(c1, c2))))
+        }
+      }
+    ),
     suite("tapError")(
       testM("Doesn't change the managed resource") {
         ZManaged
@@ -867,10 +877,10 @@ object ZManagedSpec extends ZIOBaseSpec {
           case (duration, _) =>
             ZIO.succeed(assert(duration.toNanos)(isGreaterThanEqualTo(40.milliseconds.toNanos)))
         }
-        def awaitSleeps(n: Int): ZIO[TestClock, Nothing, Unit] =
+        def awaitSleeps(n: Int): ZIO[TestClock with Live, Nothing, Unit] =
           TestClock.sleeps.flatMap {
             case x if x.length >= n => ZIO.unit
-            case _                  => ZIO.sleep(20.milliseconds).provide(zio.clock.Clock.Live) *> awaitSleeps(n)
+            case _                  => Live.live(ZIO.sleep(20.milliseconds)) *> awaitSleeps(n)
           }
         for {
           f      <- test.fork
@@ -1118,7 +1128,7 @@ object ZManagedSpec extends ZIOBaseSpec {
           ohNoes   = ";-0"
           managed  = Managed.make(ZIO.dieMessage(ohNoes))(_ => released.set(true))
           res1 <- managed.memoize.use { memoized =>
-                   assertM(memoized.use_(ZIO.unit).run)(dies(hasMessage(ohNoes)))
+                   assertM(memoized.use_(ZIO.unit).run)(dies(hasMessage(equalTo(ohNoes))))
                  }
           res2 <- assertM(released.get)(isFalse)
         } yield res1 && res2
@@ -1131,7 +1141,7 @@ object ZManagedSpec extends ZIOBaseSpec {
           memoized.use_(ZIO.unit)
         }
 
-        assertM(program.run)(dies(hasMessage(myBad)))
+        assertM(program.run)(dies(hasMessage(equalTo(myBad))))
       },
       testM("behaves properly if use dies") {
         val darn = "darn"
@@ -1143,7 +1153,7 @@ object ZManagedSpec extends ZIOBaseSpec {
                  memoized.use_(ZIO.dieMessage(darn))
                }.run
           v2 <- released.get
-        } yield assert(v1)(dies(hasMessage(darn))) && assert(v2)(isTrue)
+        } yield assert(v1)(dies(hasMessage(equalTo(darn)))) && assert(v2)(isTrue)
       },
       testM("behaves properly if use is interrupted") {
         for {
@@ -1239,12 +1249,12 @@ object ZManagedSpec extends ZIOBaseSpec {
 
   val ZManagedExampleDie: ZManaged[Any, Throwable, Int] = ZManaged.effectTotal(throw ExampleError)
 
-  def countDownLatch(n: Int): UIO[UIO[Unit]] =
+  def countDownLatch(n: Int): UIO[URIO[Live, Unit]] =
     Ref.make(n).map { counter =>
       counter.update(_ - 1) *> {
-        def await: UIO[Unit] = counter.get.flatMap { n =>
+        def await: URIO[Live, Unit] = counter.get.flatMap { n =>
           if (n <= 0) ZIO.unit
-          else ZIO.sleep(10.milliseconds).provide(zio.clock.Clock.Live) *> await
+          else Live.live(ZIO.sleep(10.milliseconds)) *> await
         }
         await
       }
@@ -1260,7 +1270,7 @@ object ZManagedSpec extends ZIOBaseSpec {
       reachedAcquisition <- Promise.make[Nothing, Unit]
       managedFiber       <- managed(reachedAcquisition.succeed(()) *> never.await).use_(IO.unit).fork
       _                  <- reachedAcquisition.await
-      interruption       <- managedFiber.interruptAs(fiberId).timeout(5.seconds).provide(zio.clock.Clock.Live)
+      interruption       <- Live.live(managedFiber.interruptAs(fiberId).timeout(5.seconds))
     } yield assert(interruption.map(_.untraced))(equalTo(expected(fiberId)))
 
   def testFinalizersPar[R, E](
@@ -1277,7 +1287,7 @@ object ZManagedSpec extends ZIOBaseSpec {
 
   def testAcquirePar[R, E](
     n: Int,
-    f: ZManaged[Any, Nothing, Unit] => ZManaged[R, E, Any]
+    f: ZManaged[Live, Nothing, Unit] => ZManaged[R, E, Any]
   ) =
     for {
       effects      <- Ref.make(0)
@@ -1294,7 +1304,7 @@ object ZManagedSpec extends ZIOBaseSpec {
 
   def testReservePar[R, E, A](
     n: Int,
-    f: ZManaged[Any, Nothing, Unit] => ZManaged[R, E, A]
+    f: ZManaged[Live, Nothing, Unit] => ZManaged[R, E, A]
   ) =
     for {
       effects      <- Ref.make(0)

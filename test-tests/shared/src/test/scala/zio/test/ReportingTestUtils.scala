@@ -5,6 +5,13 @@ import scala.{ Console => SConsole }
 import zio.clock.Clock
 import zio.test.Assertion.{ equalTo, isGreaterThan, isLessThan, isRight, isSome, not }
 import zio.test.environment.{ testEnvironmentManaged, TestClock, TestConsole, TestEnvironment }
+import zio.test.mock.ExpectationSpecUtils.Module
+import zio.test.mock.MockException.{
+  InvalidArgumentsException,
+  InvalidMethodException,
+  UnexpectedCallExpection,
+  UnmetExpectationsException
+}
 import zio.{ Cause, Managed, ZIO }
 
 object ReportingTestUtils {
@@ -30,8 +37,8 @@ object ReportingTestUtils {
   def cyan(s: String): String =
     SConsole.CYAN + s + SConsole.RESET
 
-  def yellowThenCyan(s: String): String =
-    SConsole.YELLOW + s + SConsole.CYAN
+  def yellow(s: String): String =
+    SConsole.YELLOW + s + SConsole.RESET
 
   def reportStats(success: Int, ignore: Int, failure: Int) = {
     val total = success + ignore + failure
@@ -44,14 +51,7 @@ object ReportingTestUtils {
     for {
       _ <- TestTestRunner(testEnvironmentManaged)
             .run(spec)
-            .provideSomeManaged(for {
-              logSvc   <- TestLogger.fromConsoleM.toManaged_
-              clockSvc <- TestClock.make(TestClock.DefaultData)
-            } yield new TestLogger with Clock {
-              override def testLogger: TestLogger.Service = logSvc.testLogger
-
-              override val clock: Clock.Service[Any] = clockSvc.clock
-            })
+            .provideLayer[Nothing, TestEnvironment, TestLogger with Clock](TestLogger.fromConsole ++ TestClock.default)
       output <- TestConsole.output
     } yield output.mkString
 
@@ -59,13 +59,9 @@ object ReportingTestUtils {
     for {
       results <- TestTestRunner(testEnvironmentManaged)
                   .run(spec)
-                  .provideSomeManaged(for {
-                    logSvc   <- TestLogger.fromConsoleM.toManaged_
-                    clockSvc <- TestClock.make(TestClock.DefaultData)
-                  } yield new TestLogger with Clock {
-                    override def testLogger: TestLogger.Service = logSvc.testLogger
-                    override val clock: Clock.Service[Any]      = clockSvc.clock
-                  })
+                  .provideLayer[Nothing, TestEnvironment, TestLogger with Clock](
+                    TestLogger.fromConsole ++ TestClock.default
+                  )
       actualSummary <- SummaryBuilder.buildSummary(results)
     } yield actualSummary.summary
 
@@ -86,11 +82,11 @@ object ReportingTestUtils {
     expectedFailure("Value falls within range"),
     withOffset(2)(s"${blue("52")} did not satisfy ${cyan("equalTo(42)")}\n"),
     withOffset(2)(
-      s"${blue("52")} did not satisfy ${cyan("(" + yellowThenCyan("equalTo(42)") + " || (isGreaterThan(5) && isLessThan(10)))")}\n"
+      s"${blue("52")} did not satisfy ${cyan("(") + yellow("equalTo(42)") + cyan(" || (isGreaterThan(5) && isLessThan(10)))")}\n"
     ),
     withOffset(2)(s"${blue("52")} did not satisfy ${cyan("isLessThan(10)")}\n"),
     withOffset(2)(
-      s"${blue("52")} did not satisfy ${cyan("(equalTo(42) || (isGreaterThan(5) && " + yellowThenCyan("isLessThan(10)") + "))")}\n"
+      s"${blue("52")} did not satisfy ${cyan("(equalTo(42) || (isGreaterThan(5) && ") + yellow("isLessThan(10)") + cyan("))")}\n"
     )
   )
 
@@ -114,10 +110,10 @@ object ReportingTestUtils {
     expectedFailure("Multiple nested failures"),
     withOffset(2)(s"${blue("3")} did not satisfy ${cyan("isGreaterThan(4)")}\n"),
     withOffset(2)(
-      s"${blue("Some(3)")} did not satisfy ${cyan("isSome(" + yellowThenCyan("isGreaterThan(4)") + ")")}\n"
+      s"${blue("Some(3)")} did not satisfy ${cyan("isSome(") + yellow("isGreaterThan(4)") + cyan(")")}\n"
     ),
     withOffset(2)(
-      s"${blue("Right(Some(3))")} did not satisfy ${cyan("isRight(" + yellowThenCyan("isSome(isGreaterThan(4))") + ")")}\n"
+      s"${blue("Right(Some(3))")} did not satisfy ${cyan("isRight(") + yellow("isSome(isGreaterThan(4))") + cyan(")")}\n"
     )
   )
 
@@ -136,7 +132,7 @@ object ReportingTestUtils {
     expectedFailure("labeled failures"),
     withOffset(2)(s"${blue("0")} did not satisfy ${cyan("equalTo(1)")}\n"),
     withOffset(2)(
-      s"${blue("Some(0)")} did not satisfy ${cyan("(isSome(" + yellowThenCyan("equalTo(1)") + ") ?? \"third\")")}\n"
+      s"${blue("Some(0)")} did not satisfy ${cyan("(isSome(") + yellow("equalTo(1)") + cyan(") ?? \"third\")")}\n"
     )
   )
 
@@ -147,7 +143,7 @@ object ReportingTestUtils {
     expectedFailure("Not combinator"),
     withOffset(2)(s"${blue("100")} satisfied ${cyan("equalTo(100)")}\n"),
     withOffset(2)(
-      s"${blue("100")} did not satisfy ${cyan("not(" + yellowThenCyan("equalTo(100)") + ")")}\n"
+      s"${blue("100")} did not satisfy ${cyan("not(") + yellow("equalTo(100)") + cyan(")")}\n"
     )
   )
 
@@ -175,4 +171,52 @@ object ReportingTestUtils {
   val suite4Expected = Vector(expectedFailure("Suite4")) ++
     suite1Expected.map(withOffset(2)) ++
     test3Expected.map(withOffset(2))
+
+  val mock1 = zio.test.test("Expected method, wrong arguments") {
+    throw InvalidArgumentsException(Module.command, 2, equalTo(1))
+  }
+
+  val mock1Expected = Vector(
+    expectedFailure("Expected method, wrong arguments"),
+    withOffset(2)(s"${red("- zio.test.mock.ExpectationSpecUtils.Module.command called with invalid arguments")}\n"),
+    withOffset(4)(s"${blue("2")} did not satisfy ${cyan("equalTo(1)")}\n")
+  )
+
+  val mock2 = zio.test.test("Wrong method") {
+    throw InvalidMethodException(Module.singleParam, Module.command, equalTo(1))
+  }
+
+  val mock2Expected = Vector(
+    expectedFailure("Wrong method"),
+    withOffset(2)(s"${red("- invalid call to zio.test.mock.ExpectationSpecUtils.Module.singleParam")}\n"),
+    withOffset(4)(s"expected zio.test.mock.ExpectationSpecUtils.Module.command with arguments ${cyan("equalTo(1)")}\n")
+  )
+
+  val mock3 = zio.test.test("Unsatisfied expectations") {
+    throw UnmetExpectationsException(
+      List(
+        Module.command -> (equalTo(2)),
+        Module.command -> (equalTo(3))
+      )
+    )
+  }
+
+  val mock3Expected = Vector(
+    expectedFailure("Unsatisfied expectations"),
+    withOffset(2)(s"${red("- unmet expectations")}\n"),
+    withOffset(4)(s"expected zio.test.mock.ExpectationSpecUtils.Module.command with arguments ${cyan("equalTo(2)")}\n"),
+    withOffset(4)(s"expected zio.test.mock.ExpectationSpecUtils.Module.command with arguments ${cyan("equalTo(3)")}\n")
+  )
+
+  val mock4 = zio.test.test("Extra calls") {
+    throw UnexpectedCallExpection(Module.manyParams, (2, "3", 4L))
+  }
+
+  val mock4Expected = Vector(
+    expectedFailure("Extra calls"),
+    withOffset(2)(
+      s"${red("- unexpected call to zio.test.mock.ExpectationSpecUtils.Module.manyParams with arguments")}\n"
+    ),
+    withOffset(4)(s"${cyan("(2,3,4)")}\n")
+  )
 }

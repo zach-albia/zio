@@ -1,7 +1,5 @@
 package zio
 
-import zio.clock.Clock
-import zio.duration.durationInt
 import zio.test.Assertion._
 import zio.test._
 
@@ -107,7 +105,7 @@ object RefMSpec extends ZIOBaseSpec {
       for {
         refM  <- RefM.make[State](Active)
         value <- refM.modifySome("State doesn't change") { case Active => IO.dieMessage(fatalError) }.run
-      } yield assert(value)(dies(hasMessage(fatalError)))
+      } yield assert(value)(dies(hasMessage(equalTo(fatalError))))
     },
     testM("interrupt parent fiber and update") {
       for {
@@ -117,8 +115,8 @@ object RefMSpec extends ZIOBaseSpec {
         fiber       <- makeAndWait.fork
         refM        <- promise.await
         _           <- fiber.interrupt
-        value       <- refM.update(_ => ZIO.succeed(Closed)).timeout(1.second).provide(Clock.Live)
-      } yield assert(value)(equalTo(Some(Closed)))
+        value       <- refM.update(_ => ZIO.succeed(Closed))
+      } yield assert(value)(equalTo(Closed))
     }
   )
 

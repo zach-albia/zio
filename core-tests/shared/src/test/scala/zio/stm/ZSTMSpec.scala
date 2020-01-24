@@ -5,6 +5,8 @@ import zio.duration._
 import zio.test.Assertion._
 import zio.test.TestAspect.nonFlaky
 import zio.test._
+import zio.test._
+import zio.test.environment.Live
 
 object ZSTMSpec extends ZIOBaseSpec {
 
@@ -414,6 +416,34 @@ object ZSTMSpec extends ZIOBaseSpec {
         } yield assert(result)(equalTo(2 -> 2))
       }
     ),
+    suite("when combinators")(
+      testM("when true") {
+        for {
+          ref    <- TRef.make(false).commit
+          result <- (STM.when(true)(ref.set(true)) *> ref.get).commit
+        } yield assert(result)(equalTo(true))
+      },
+      testM("when false") {
+        for {
+          ref    <- TRef.make(false).commit
+          result <- (STM.when(false)(ref.set(true)) *> ref.get).commit
+        } yield assert(result)(equalTo(false))
+      },
+      testM("whenM true") {
+        for {
+          ref    <- TRef.make(0).commit
+          isZero = ref.get.map(_ == 0)
+          result <- (STM.whenM(isZero)(ref.update(_ + 1)) *> ref.get).commit
+        } yield assert(result)(equalTo(1))
+      },
+      testM("whenM false") {
+        for {
+          ref       <- TRef.make(0).commit
+          isNotZero = ref.get.map(_ != 0)
+          result    <- (STM.whenM(isNotZero)(ref.update(_ + 1)) *> ref.get).commit
+        } yield assert(result)(equalTo(0))
+      }
+    ),
     suite("STM issue 2073") {
       testM("read only STM shouldn't return partial state of concurrent read-write STM") {
         for {
@@ -489,7 +519,17 @@ object ZSTMSpec extends ZIOBaseSpec {
             assertM(env.ref.get.commit)(equalTo(1))
         }
       }
-    )
+    ),
+    testM("STM collectAll ordering") {
+      val tx = for {
+        tq  <- TQueue.bounded[Int](3)
+        _   <- tq.offer(1)
+        _   <- tq.offer(2)
+        _   <- tq.offer(3)
+        ans <- ZSTM.collectAll(List(tq.take, tq.take, tq.take))
+      } yield ans
+      assertM(tx.commit)(equalTo(List(1, 2, 3)))
+    }
   )
 
   trait STMEnv {
@@ -520,7 +560,7 @@ object ZSTMSpec extends ZIOBaseSpec {
         .eventually
   }
 
-  def liveClockSleep(d: Duration) = ZIO.sleep(d).provide(zio.clock.Clock.Live)
+  def liveClockSleep(d: Duration) = Live.live(ZIO.sleep(d))
 
   def incrementVarN(n: Int, tvar: TRef[Int]): ZIO[clock.Clock, Nothing, Int] =
     STM

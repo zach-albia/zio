@@ -322,6 +322,16 @@ final class ZSTM[-R, +E, +A] private[stm] (
   def withFilter(f: A => Boolean): ZSTM[R, E, A] = filter(f)
 
   /**
+   * The moral equivalent of `if (p) exp`
+   */
+  def when(b: Boolean): ZSTM[R, E, Unit] = ZSTM.when(b)(self)
+
+  /**
+   * The moral equivalent of `if (p) exp` when `p` has side-effects
+   */
+  def whenM[R1 <: R, E1 >: E](b: ZSTM[R1, E1, Boolean]): ZSTM[R1, E1, Unit] = ZSTM.whenM(b)(self)
+
+  /**
    * Named alias for `<*>`.
    */
   def zip[R1 <: R, E1 >: E, B](that: => ZSTM[R1, E1, B]): ZSTM[R1, E1, (A, B)] =
@@ -819,14 +829,23 @@ object ZSTM {
   def check(p: Boolean): STM[Nothing, Unit] = if (p) STM.unit else retry
 
   /**
+   * The moral equivalent of `if (p) exp`
+   */
+  def when[R, E](b: Boolean)(stm: ZSTM[R, E, Any]): ZSTM[R, E, Unit] =
+    if (b) stm.unit else unit
+
+  /**
+   * The moral equivalent of `if (p) exp` when `p` has side-effects
+   */
+  def whenM[R, E](b: ZSTM[R, E, Boolean])(stm: ZSTM[R, E, Any]): ZSTM[R, E, Unit] =
+    b.flatMap(b => if (b) stm.unit else unit)
+
+  /**
    * Collects all the transactional effects in a list, returning a single
    * transactional effect that produces a list of values.
    */
   def collectAll[E, A](i: Iterable[STM[E, A]]): STM[E, List[A]] =
-    i.foldRight[STM[E, List[A]]](STM.succeed(Nil)) {
-      case (stm, acc) =>
-        acc.zipWith(stm)((xs, x) => x :: xs)
-    }
+    i.foldRight[STM[E, List[A]]](STM.succeed(Nil))(_.zipWith(_)(_ :: _))
 
   /**
    * Kills the fiber running the effect.
